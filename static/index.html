@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>MCP AI System</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  body { font-family: Inter, system-ui, sans-serif; }
+  .mono { font-family: "JetBrains Mono", Consolas, monospace; }
+  .fade-in { animation: fadeIn .4s ease; }
+  @keyframes fadeIn { from {opacity:0; transform:translateY(4px);} to {opacity:1; transform:none;} }
+  .pulse { animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .4; } }
+  .scroll-area::-webkit-scrollbar { width: 8px; }
+  .scroll-area::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const SUGGESTIONS = [
+  "Show me the top 3 customers by total spending",
+  "Which product has the lowest average rating?",
+  "What does the return policy say?",
+  "Give me a full customer report for user_id=3",
+  "Summarize revenue by product category",
+];
+
+function ToolCall({ call, result }) {
+  return (
+    <div className="border border-violet-200 bg-violet-50 rounded-lg p-3 text-sm fade-in">
+      <div className="flex items-center gap-2 text-violet-700 font-semibold">
+        <span>🛠️</span>
+        <span className="mono">{call.tool}</span>
+        {!result && <span className="pulse text-xs">running…</span>}
+      </div>
+      <div className="mt-1 text-xs text-slate-600 mono">
+        args: {JSON.stringify(call.args)}
+      </div>
+      {result && (
+        <details className="mt-2">
+          <summary className="cursor-pointer text-xs text-violet-700">
+            result ({Array.isArray(result) ? result.length + " items" : typeof result})
+          </summary>
+          <pre className="mt-1 text-xs bg-white p-2 rounded border overflow-x-auto max-h-60">
+            {JSON.stringify(result, null, 2)}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function Message({ msg }) {
+  if (msg.role === "user") {
+    return (
+      <div className="flex justify-end">
+        <div className="bg-slate-900 text-white rounded-2xl rounded-br-sm px-4 py-2 max-w-[70%]">
+          {msg.text}
+        </div>
+      </div>
+    );
+  }
+
+  const toolCalls = msg.trace.filter(e => e.type === "tool_call");
+  const toolResults = msg.trace.filter(e => e.type === "tool_result");
+  const resultMap = {};
+  toolResults.forEach(r => { resultMap[r.tool] = r.result; });
+
+  return (
+    <div className="flex justify-start">
+      <div className="bg-white border rounded-2xl rounded-bl-sm px-4 py-3 max-w-[85%] space-y-2 shadow-sm">
+        {toolCalls.length > 0 && (
+          <div className="space-y-2">
+            {toolCalls.map((tc, i) => (
+              <ToolCall key={i} call={tc} result={resultMap[tc.tool]} />
+            ))}
+          </div>
+        )}
+        {msg.answer && (
+          <div className="text-slate-800 whitespace-pre-wrap leading-relaxed">
+            {msg.answer}
+          </div>
+        )}
+        {msg.loading && !msg.answer && (
+          <div className="text-slate-400 text-sm pulse">thinking…</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [tools, setTools] = useState([]);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    fetch("/tools").then(r => r.json()).then(setTools).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages]);
+
+  async function send(text) {
+    if (!text.trim() || loading) return;
+    const userMsg = { role: "user", text };
+    const assistantMsg = { role: "assistant", trace: [], answer: "", loading: true };
+    setMessages(prev => [...prev, userMsg, assistantMsg]);
+    setInput("");
+    setLoading(true);
+
+    try {
+      const res = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text }),
+      });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6).trim();
+          if (payload === "[DONE]") continue;
+          try {
+            const ev = JSON.parse(payload);
+            setMessages(prev => {
+              const copy = [...prev];
+              const last = { ...copy[copy.length - 1] };
+              if (ev.type === "tool_call" || ev.type === "tool_result") {
+                last.trace = [...last.trace, ev];
+              } else if (ev.type === "answer") {
+                last.answer = ev.text;
+                last.loading = false;
+              }
+              copy[copy.length - 1] = last;
+              return copy;
+            });
+          } catch {}
+        }
+      }
+      // ensure loading flag is cleared
+      setMessages(prev => {
+        const copy = [...prev];
+        const last = { ...copy[copy.length - 1], loading: false };
+        copy[copy.length - 1] = last;
+        return copy;
+      });
+    } catch (e) {
+      setMessages(prev => {
+        const copy = [...prev];
+        const last = { ...copy[copy.length - 1],
+          answer: "Error: " + e.message, loading: false };
+        copy[copy.length - 1] = last;
+        return copy;
+      });
+    }
+    setLoading(false);
+  }
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      <header className="bg-white border-b px-6 py-4 flex justify-between items-center">
+        <div>
+          <h1 className="text-xl font-bold flex items-center gap-2">
+            🔌 MCP AI System
+          </h1>
+          <p className="text-xs text-slate-500">
+            Model Context Protocol · {tools.length} tools · 4-table DB · RAG
+          </p>
+        </div>
+        <div className="flex items-center gap-2 text-xs">
+          <span className="px-2 py-1 bg-violet-100 text-violet-700 rounded">Groq</span>
+          <span className="px-2 py-1 bg-emerald-100 text-emerald-700 rounded">MCP</span>
+          <span className="px-2 py-1 bg-amber-100 text-amber-700 rounded">RAG</span>
+        </div>
+      </header>
+
+      <div className="flex flex-1 overflow-hidden">
+        {/* Sidebar */}
+        <aside className="w-64 border-r bg-white p-4 overflow-y-auto scroll-area">
+          <h2 className="text-xs uppercase font-semibold text-slate-500 mb-2">
+            MCP Tools ({tools.length})
+          </h2>
+          <div className="space-y-1">
+            {tools.map(t => (
+              <div key={t.function.name}
+                   className="p-2 rounded hover:bg-slate-50 border border-transparent hover:border-slate-200">
+                <div className="text-sm font-semibold mono text-violet-700">
+                  {t.function.name}
+                </div>
+                <div className="text-xs text-slate-500 line-clamp-2">
+                  {t.function.description}
+                </div>
+              </div>
+            ))}
+          </div>
+        </aside>
+
+        {/* Chat */}
+        <main className="flex-1 flex flex-col">
+          <div ref={scrollRef}
+               className="flex-1 overflow-y-auto p-6 space-y-4 scroll-area">
+            {messages.length === 0 && (
+              <div className="max-w-2xl mx-auto text-center mt-10">
+                <h2 className="text-2xl font-bold mb-2">
+                  Ask anything about your shop
+                </h2>
+                <p className="text-slate-500 mb-6">
+                  I'll use MCP tools to query the database and search documentation.
+                  Watch every tool call happen live in the chat.
+                </p>
+                <div className="grid gap-2">
+                  {SUGGESTIONS.map(s => (
+                    <button key={s}
+                            onClick={() => send(s)}
+                            className="text-left p-3 bg-white border rounded-lg hover:border-violet-400 hover:bg-violet-50 text-sm transition">
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {messages.map((m, i) => <Message key={i} msg={m} />)}
+          </div>
+
+          <div className="border-t p-4 bg-white">
+            <form onSubmit={e => { e.preventDefault(); send(input); }}
+                  className="flex gap-2 max-w-4xl mx-auto">
+              <input
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                placeholder="Ask about customers, products, orders, or docs…"
+                className="flex-1 border rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-violet-400"
+                disabled={loading}
+              />
+              <button type="submit" disabled={loading || !input.trim()}
+                      className="bg-slate-900 text-white px-6 rounded-lg font-semibold disabled:opacity-40">
+                {loading ? "…" : "Send"}
+              </button>
+            </form>
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
